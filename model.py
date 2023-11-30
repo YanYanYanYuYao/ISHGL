@@ -2,8 +2,8 @@ import datetime
 import math
 import numpy as np
 import torch
-from torch import nn, backends
-from torch.nn import Module, Parameter
+from torch import nn
+from torch.nn import Module
 import torch.sparse
 from numba import jit
 import heapq
@@ -21,17 +21,15 @@ def trans_to_cpu(variable):
     else:
         return variable
 
-
-class HyperConv(Module):
-    def __init__(self, layers, dataset, emb_size=100):
-        super(HyperConv, self).__init__()
-        self.emb_size = emb_size
+class HyperConvolution(Module):
+    def __init__(self, layers, dataset):
+        super(HyperConvolution, self).__init__()
         self.layers = layers
         self.dataset = dataset
     def forward(self, adjacency, embedding):
         item_embeddings = embedding
-        item_embedding_layer0 = item_embeddings
-        final = [item_embedding_layer0]
+        item_embedding_layer_input = item_embeddings
+        final = [item_embedding_layer_input]
         for i in range(self.layers):
             item_embeddings = torch.sparse.mm(trans_to_cuda(adjacency), item_embeddings)
             final.append(item_embeddings)
@@ -39,9 +37,9 @@ class HyperConv(Module):
         return item_embeddings
 
 class ISHGL(Module):
-    def __init__(self, adjacency, n_node, lr, layers, l2, beta, dataset, emb_size=100, batch_size=100):
+    def __init__(self, adjacency, n_node, lr, layers, l2, beta, dataset, embedding_size, batch_size):
         super(ISHGL, self).__init__()
-        self.emb_size = emb_size
+        self.embedding_size = embedding_size
         self.batch_size = batch_size
         self.n_node = n_node
         self.L2 = l2
@@ -56,36 +54,36 @@ class ISHGL(Module):
         shape = adjacency.shape
         adjacency = torch.sparse.FloatTensor(i, v, torch.Size(shape))
         self.adjacency = adjacency
-        self.embedding = nn.Embedding(self.n_node, self.emb_size)
-        self.pos_embedding = nn.Embedding(300, self.emb_size)
-        self.HyperGraph = HyperConv(self.layers, dataset)
-        self.w_1 = nn.Linear(2 * self.emb_size, self.emb_size)
-        self.w_2 = nn.Parameter(torch.Tensor(self.emb_size, 1))
-        self.glu1 = nn.Linear(self.emb_size, self.emb_size)
-        self.glu2 = nn.Linear(self.emb_size, self.emb_size, bias=False)
+        self.embedding = nn.Embedding(self.n_node, self.embedding_size)
+        self.pos_embedding = nn.Embedding(300, self.embedding_size)
+        self.HyperGraph = HyperConvolution(self.layers, dataset)
+        self.w_1 = nn.Linear(2 * self.embedding_size, self.embedding_size)
+        self.w_2 = nn.Parameter(torch.Tensor(self.embedding_size, 1))
+        self.glu1 = nn.Linear(self.embedding_size, self.embedding_size)
+        self.glu2 = nn.Linear(self.embedding_size, self.embedding_size, bias=False)
         self.loss_function = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
         self.init_parameters()
 
     def init_parameters(self):
-        stdv = 1.0 / math.sqrt(self.emb_size)
+        stdv = 1.0 / math.sqrt(self.embedding_size)
         for weight in self.parameters():
             weight.data.uniform_(-stdv, stdv)
 
-    def generate_sess_emb(self, item_embedding, session_item, session_len, reversed_sess_item, mask):
-        zeros = torch.cuda.FloatTensor(1, self.emb_size).fill_(0)
+    def generate_session_embedding(self, item_embedding, session_item, session_len, reversed_sess_item, mask):
+        zeros = torch.cuda.FloatTensor(1, self.embedding_size).fill_(0)
         item_embedding = torch.cat([zeros, item_embedding], 0)
         get = lambda i: item_embedding[reversed_sess_item[i]]
-        seq_h = torch.cuda.FloatTensor(self.batch_size, list(reversed_sess_item.shape)[1], self.emb_size).fill_(0)
+        seq_h = torch.cuda.FloatTensor(self.batch_size, list(reversed_sess_item.shape)[1], self.embedding_size).fill_(0)
         for i in torch.arange(session_item.shape[0]):
             seq_h[i] = get(i)
         hs = torch.div(torch.sum(seq_h, 1), session_len)
         mask = mask.float().unsqueeze(-1)
         len = seq_h.shape[1]
-        pos_emb = self.pos_embedding.weight[:len]
-        pos_emb = pos_emb.unsqueeze(0).repeat(self.batch_size, 1, 1)
+        pos_embedding = self.pos_embedding.weight[:len]
+        pos_embedding = pos_embedding.unsqueeze(0).repeat(self.batch_size, 1, 1)
         hs = hs.unsqueeze(-2).repeat(1, len, 1)
-        nh = self.w_1(torch.cat([pos_emb, seq_h], -1))
+        nh = self.w_1(torch.cat([pos_embedding, seq_h], -1))
         nh = torch.tanh(nh)
         nh = torch.sigmoid(self.glu1(nh) + self.glu2(hs))
         beta = torch.matmul(nh, self.w_2)
@@ -93,29 +91,10 @@ class ISHGL(Module):
         select = torch.sum(beta * seq_h, 1)
         return select
 
-    def generate_sess_emb_npos(self, item_embedding, session_item, session_len, reversed_sess_item, mask):
-        zeros = torch.cuda.FloatTensor(1, self.emb_size).fill_(0)
-        item_embedding = torch.cat([zeros, item_embedding], 0)
-        get = lambda i: item_embedding[reversed_sess_item[i]]
-        seq_h = torch.cuda.FloatTensor(self.batch_size, list(reversed_sess_item.shape)[1], self.emb_size).fill_(0)
-        for i in torch.arange(session_item.shape[0]):
-            seq_h[i] = get(i)
-        hs = torch.div(torch.sum(seq_h, 1), session_len)
-        mask = mask.float().unsqueeze(-1)
-        len = seq_h.shape[1]
-        hs = hs.unsqueeze(-2).repeat(1, len, 1)
-        nh = seq_h
-        nh = torch.tanh(nh)
-        nh = torch.sigmoid(self.glu1(nh) + self.glu2(hs))
-        beta = torch.matmul(nh, self.w_2)
-        beta = beta * mask
-        select = torch.sum(beta * seq_h, 1)
-        return select
     def forward(self, session_item, session_len, reversed_sess_item, mask):
-        item_embeddings_hg = self.HyperGraph(self.adjacency, self.embedding.weight)
-        sess_emb_hgnn = self.generate_sess_emb(item_embeddings_hg, session_item, session_len, reversed_sess_item,
-                                                   mask)
-        return item_embeddings_hg, sess_emb_hgnn, self.beta
+        item_embedding = self.HyperGraph(self.adjacency, self.embedding.weight)
+        session_embedding = self.generate_session_embedding(item_embedding, session_item, session_len, reversed_sess_item, mask)
+        return item_embedding, session_embedding, self.beta
 
 
 @jit(nopython=True)
@@ -131,36 +110,33 @@ def find_k_largest(K, candidates):
     ids = [item[1] for item in n_candidates]
     return ids
 
-def SSL_sess(sess_emb_hgnn, target_emb):
+def SSL(session_embedding, target_embedding):
     def row_shuffle(embedding):
         corrupted_embedding = embedding[torch.randperm(embedding.size()[0])]
         return corrupted_embedding
     def score(x1, x2):
         return torch.sum(torch.mul(x1, x2), 1)
-    pos = score(sess_emb_hgnn, target_emb)
-    neg = score(target_emb, row_shuffle(sess_emb_hgnn))
-    one = torch.cuda.FloatTensor(neg.shape[0]).fill_(1)
-    con_loss = torch.sum(-torch.log(1e-8 + torch.sigmoid(pos)) - torch.log(1e-8 + (one - torch.sigmoid(neg))))
-    return con_loss
+    positive = score(session_embedding, target_embedding)
+    negative = score(target_embedding, row_shuffle(session_embedding))
+    one = torch.cuda.FloatTensor(negative.shape[0]).fill_(1)
+    SSL_loss = torch.sum(-torch.log(1e-8 + torch.sigmoid(positive)) - torch.log(1e-8 + (one - torch.sigmoid(negative))))
+    return SSL_loss
 
 
 
 def forward(model, i, data,train):
-    tar, session_len, session_item, reversed_sess_item, mask = data.get_slice(i)
-    A_hat, D_hat = data.get_overlap(session_item)
+    tar, session_len, session_item, reversed_session_item, mask = data.get_slice(i)
     session_item = trans_to_cuda(torch.Tensor(session_item).long())
     session_len = trans_to_cuda(torch.Tensor(session_len).long())
-    A_hat = trans_to_cuda(torch.Tensor(A_hat))
-    D_hat = trans_to_cuda(torch.Tensor(D_hat))
     tar = trans_to_cuda(torch.Tensor(tar).long())
     mask = trans_to_cuda(torch.Tensor(mask).long())
-    reversed_sess_item = trans_to_cuda(torch.Tensor(reversed_sess_item).long())
-    item_emb_hg, sess_emb_hgnn, beta = model(session_item, session_len, D_hat, A_hat, reversed_sess_item, mask)
+    reversed_sess_item = trans_to_cuda(torch.Tensor(reversed_session_item).long())
+    item_embedding, session_embedding, beta = model(session_item, session_len, reversed_sess_item, mask)
     if train:
-        con_loss_1 = SSL_sess(sess_emb_hgnn,item_emb_hg[tar])*beta
+        con_loss_1 = SSL(session_embedding,item_embedding[tar])*beta
     else:
         con_loss_1 = 0
-    scores = torch.mm(sess_emb_hgnn, torch.transpose(item_emb_hg, 1, 0))
+    scores = torch.mm(session_embedding, torch.transpose(item_embedding, 1, 0))
     return tar, scores, con_loss_1
 
 
@@ -179,7 +155,7 @@ def train_test(model, train_data, test_data):
         model.optimizer.step()
         total_loss += loss
     print('\tLoss:\t%.3f' % total_loss)
-    top_K = [5, 10, 20]
+    top_K = [10, 20]
     metrics = {}
     for K in top_K:
         metrics['hit%d' % K] = []

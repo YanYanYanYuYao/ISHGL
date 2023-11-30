@@ -15,18 +15,6 @@ def data_masks(all_sessions, n_node):
     matrix = csr_matrix((data, indices, indptr), shape=(len(all_sessions), n_node))
     return matrix
 
-def split_validation(train_set, valid_portion):
-    train_set_x, train_set_y = train_set
-    n_samples = len(train_set_x)
-    sidx = np.arange(n_samples, dtype='int32')
-    np.random.shuffle(sidx)
-    n_train = int(np.round(n_samples * (1. - valid_portion)))
-    valid_set_x = [train_set_x[s] for s in sidx[n_train:]]
-    valid_set_y = [train_set_y[s] for s in sidx[n_train:]]
-    train_set_x = [train_set_x[s] for s in sidx[:n_train]]
-    train_set_y = [train_set_y[s] for s in sidx[:n_train]]
-    return (train_set_x, train_set_y), (valid_set_x, valid_set_y)
-
 class Data():
     def __init__(self, data, shuffle=False, n_node=None):
         self.raw = np.asarray(data[0])
@@ -42,23 +30,6 @@ class Data():
         self.targets = np.asarray(data[1])
         self.length = len(self.raw)
         self.shuffle = shuffle
-
-    def get_overlap(self, sessions):
-        matrix = np.zeros((len(sessions), len(sessions)))
-        for i in range(len(sessions)):
-            seq_a = set(sessions[i])
-            seq_a.discard(0)
-            for j in range(i+1, len(sessions)):
-                seq_b = set(sessions[j])
-                seq_b.discard(0)
-                overlap = seq_a.intersection(seq_b)
-                ab_set = seq_a | seq_b
-                matrix[i][j] = float(len(overlap))/float(len(ab_set))
-                matrix[j][i] = matrix[i][j]
-        matrix = matrix + np.diag([1.0]*len(sessions))
-        degree = np.sum(np.array(matrix), 1)
-        degree = np.diag(1.0/degree)
-        return matrix, degree
 
     def generate_batch(self, batch_size):
         if self.shuffle:
